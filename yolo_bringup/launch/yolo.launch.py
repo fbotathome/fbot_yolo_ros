@@ -34,12 +34,15 @@ def generate_launch_description():
         use_3d = eval(context.perform_substitution(use_3d))
 
         share_dir = get_package_share_directory("yolo_ros")
-        subprocess.run(["uv", "sync", "--project", share_dir], check=True)
-        venv_site_pkgs = glob.glob(
-            os.path.join(share_dir, ".venv", "lib", "python*", "site-packages")
-        )
+        # subprocess.run(["uv", "sync", "--project", share_dir], check=True)
+        # venv_site_pkgs = glob.glob(
+        #     os.path.join(share_dir, ".venv", "lib", "python*", "site-packages")
+        # )
+        # existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        # new_pythonpath = ":".join(venv_site_pkgs + [existing_pythonpath]).strip(":")
         existing_pythonpath = os.environ.get("PYTHONPATH", "")
-        new_pythonpath = ":".join(venv_site_pkgs + [existing_pythonpath]).strip(":")
+        new_pythonpath = existing_pythonpath  # usa o PYTHONPATH do sistema
+
 
         model_type = LaunchConfiguration("model_type")
         model_type_cmd = DeclareLaunchArgument(
@@ -157,7 +160,7 @@ def generate_launch_description():
         input_image_topic = LaunchConfiguration("input_image_topic")
         input_image_topic_cmd = DeclareLaunchArgument(
             "input_image_topic",
-            default_value="/camera/rgb/image_raw",
+            default_value="/femtobolt/color/image_raw",
             description="Name of the input image topic",
         )
 
@@ -172,7 +175,7 @@ def generate_launch_description():
         input_depth_topic = LaunchConfiguration("input_depth_topic")
         input_depth_topic_cmd = DeclareLaunchArgument(
             "input_depth_topic",
-            default_value="/camera/depth/image_raw",
+            default_value="/femtobolt/depth/image_unaligned",
             description="Name of the input depth topic",
         )
 
@@ -187,7 +190,7 @@ def generate_launch_description():
         input_depth_info_topic = LaunchConfiguration("input_depth_info_topic")
         input_depth_info_topic_cmd = DeclareLaunchArgument(
             "input_depth_info_topic",
-            default_value="/camera/depth/camera_info",
+            default_value="/femtobolt/depth/camera_info",
             description="Name of the input depth info topic",
         )
 
@@ -307,7 +310,12 @@ def generate_launch_description():
             name="debug_node",
             namespace=namespace,
             additional_env={"PYTHONPATH": new_pythonpath},
-            parameters=[{"image_reliability": image_reliability}],
+            parameters=[
+                {
+                    "image_reliability": image_reliability,
+                    "use_3d": use_3d,
+                }
+            ],
             remappings=[
                 ("image_raw", input_image_topic),
                 ("detections", debug_detections_topic),

@@ -35,8 +35,8 @@ from ultralytics.utils import IterableSimpleNamespace, YAML
 from ultralytics.utils.checks import check_requirements, check_yaml
 
 from sensor_msgs.msg import Image
-from yolo_msgs.msg import Detection
-from yolo_msgs.msg import DetectionArray
+from fbot_vision_msgs.msg import Detection2D
+from fbot_vision_msgs.msg import Detection2DArray
 
 
 class TrackingNode(LifecycleNode):
@@ -79,7 +79,7 @@ class TrackingNode(LifecycleNode):
         )
 
         self.tracker = self.create_tracker(tracker_name)
-        self._pub = self.create_publisher(DetectionArray, "tracking", 10)
+        self._pub = self.create_publisher(Detection2DArray, "tracking", 10)
 
         super().on_configure(state)
         self.get_logger().info(f"[{self.get_name()}] Configured")
@@ -109,7 +109,7 @@ class TrackingNode(LifecycleNode):
             self, Image, "image_raw", qos_profile=image_qos_profile
         )
         self.detections_sub = message_filters.Subscriber(
-            self, DetectionArray, "detections", qos_profile=10
+            self, Detection2DArray, "detections", qos_profile=10
         )
 
         self._synchronizer = message_filters.ApproximateTimeSynchronizer(
@@ -199,7 +199,7 @@ class TrackingNode(LifecycleNode):
         tracker = TRACKER_MAP[cfg.tracker_type](args=cfg, frame_rate=1)
         return tracker
 
-    def detections_cb(self, img_msg: Image, detections_msg: DetectionArray) -> None:
+    def detections_cb(self, img_msg: Image, detections_msg: Detection2DArray) -> None:
         """
         Synchronized callback for image and detections.
 
@@ -209,8 +209,9 @@ class TrackingNode(LifecycleNode):
         @param detections_msg Detections message
         """
 
-        tracked_detections_msg = DetectionArray()
+        tracked_detections_msg = Detection2DArray()
         tracked_detections_msg.header = img_msg.header
+        tracked_detections_msg.image_rgb = img_msg
 
         # Convert image
         cv_image = self.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
@@ -218,17 +219,17 @@ class TrackingNode(LifecycleNode):
 
         # Parse detections
         detection_list = []
-        detection: Detection
+        detection: Detection2D
         for detection in detections_msg.detections:
 
             detection_list.append(
                 [
-                    detection.bbox.center.position.x - detection.bbox.size.x / 2,
-                    detection.bbox.center.position.y - detection.bbox.size.y / 2,
-                    detection.bbox.center.position.x + detection.bbox.size.x / 2,
-                    detection.bbox.center.position.y + detection.bbox.size.y / 2,
+                    detection.bbox.center.position.x - detection.bbox.size_x / 2,
+                    detection.bbox.center.position.y - detection.bbox.size_y / 2,
+                    detection.bbox.center.position.x + detection.bbox.size_x / 2,
+                    detection.bbox.center.position.y + detection.bbox.size_y / 2,
                     detection.score,
-                    detection.class_id,
+                    detection.class_num,
                 ]
             )
 
@@ -243,20 +244,22 @@ class TrackingNode(LifecycleNode):
                 for t in tracks:
 
                     tracked_box = Boxes(t[:-1], (img_msg.height, img_msg.width))
-                    tracked_detection: Detection = detections_msg.detections[int(t[-1])]
+                    tracked_detection: Detection2D = detections_msg.detections[int(t[-1])]
+                    tracked_detection.header = img_msg.header
 
                     # Get boxes values
                     box = tracked_box.xywh[0]
                     tracked_detection.bbox.center.position.x = float(box[0])
                     tracked_detection.bbox.center.position.y = float(box[1])
-                    tracked_detection.bbox.size.x = float(box[2])
-                    tracked_detection.bbox.size.y = float(box[3])
+                    tracked_detection.bbox.size_x = float(box[2])
+                    tracked_detection.bbox.size_y = float(box[3])
 
                     # Get track ID
-                    track_id = ""
+                    track_id = -1
                     if tracked_box.is_track:
-                        track_id = str(int(tracked_box.id))
+                        track_id = int(tracked_box.id)
                     tracked_detection.id = track_id
+                    tracked_detection.type = Detection2D.TRACKING
 
                     # Append msg
                     tracked_detections_msg.detections.append(tracked_detection)

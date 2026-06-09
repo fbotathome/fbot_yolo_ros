@@ -36,11 +36,12 @@ from ultralytics.utils.plotting import Annotator, colors
 from sensor_msgs.msg import Image
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
-from yolo_msgs.msg import BoundingBox2D
-from yolo_msgs.msg import KeyPoint2D
-from yolo_msgs.msg import KeyPoint3D
-from yolo_msgs.msg import Detection
-from yolo_msgs.msg import DetectionArray
+from vision_msgs.msg import BoundingBox2D
+from fbot_vision_msgs.msg import Detection2D
+from fbot_vision_msgs.msg import Detection2DArray
+from fbot_vision_msgs.msg import Detection3DArray
+from fbot_vision_msgs.msg import KeyPoint2D
+from fbot_vision_msgs.msg import KeyPoint3D
 
 
 class DebugNode(LifecycleNode):
@@ -64,6 +65,7 @@ class DebugNode(LifecycleNode):
 
         # Params
         self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
+        self.declare_parameter("use_3d", False)
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """
@@ -84,6 +86,7 @@ class DebugNode(LifecycleNode):
             durability=QoSDurabilityPolicy.VOLATILE,
             depth=1,
         )
+        self.use_3d = self.get_parameter("use_3d").get_parameter_value().bool_value
 
         # Pubs
         self._dbg_pub = self.create_publisher(Image, "dbg_image", 10)
@@ -110,8 +113,9 @@ class DebugNode(LifecycleNode):
         self.image_sub = message_filters.Subscriber(
             self, Image, "image_raw", qos_profile=self.image_qos_profile
         )
+        detections_msg_type = Detection3DArray if self.use_3d else Detection2DArray
         self.detections_sub = message_filters.Subscriber(
-            self, DetectionArray, "detections", qos_profile=10
+            self, detections_msg_type, "detections", qos_profile=10
         )
 
         self._synchronizer = message_filters.ApproximateTimeSynchronizer(
@@ -182,7 +186,7 @@ class DebugNode(LifecycleNode):
     def draw_box(
         self,
         cv_image: np.ndarray,
-        detection: Detection,
+        detection,
         color: Tuple[int],
     ) -> np.ndarray:
         """
@@ -197,18 +201,18 @@ class DebugNode(LifecycleNode):
         """
 
         # Get detection info
-        class_name = detection.class_name
+        class_name = detection.label
         score = detection.score
-        box_msg: BoundingBox2D = detection.bbox
+        box_msg: BoundingBox2D = detection.bbox2d if hasattr(detection, "bbox2d") else detection.bbox
         track_id = detection.id
 
         min_pt = (
-            round(box_msg.center.position.x - box_msg.size.x / 2.0),
-            round(box_msg.center.position.y - box_msg.size.y / 2.0),
+            round(box_msg.center.position.x - box_msg.size_x / 2.0),
+            round(box_msg.center.position.y - box_msg.size_y / 2.0),
         )
         max_pt = (
-            round(box_msg.center.position.x + box_msg.size.x / 2.0),
-            round(box_msg.center.position.y + box_msg.size.y / 2.0),
+            round(box_msg.center.position.x + box_msg.size_x / 2.0),
+            round(box_msg.center.position.y + box_msg.size_y / 2.0),
         )
 
         # Define the four corners of the rectangle
@@ -239,7 +243,7 @@ class DebugNode(LifecycleNode):
 
         # Write text
         label = f"{class_name}"
-        label += f" ({track_id})" if track_id else ""
+        label += f" ({track_id})" if track_id >= 0 else ""
         label += " ({:.3f})".format(score)
         pos = (min_pt[0] + 5, min_pt[1] + 25)
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -250,7 +254,7 @@ class DebugNode(LifecycleNode):
     def draw_mask(
         self,
         cv_image: np.ndarray,
-        detection: Detection,
+        detection,
         color: Tuple[int],
     ) -> np.ndarray:
         """
@@ -264,24 +268,23 @@ class DebugNode(LifecycleNode):
         @return Modified image with drawn mask
         """
 
-        mask_msg = detection.mask
-        mask_array = np.array([[int(ele.x), int(ele.y)] for ele in mask_msg.data])
-
-        if mask_msg.data:
-            layer = cv_image.copy()
-            layer = cv2.fillPoly(layer, pts=[mask_array], color=color)
-            cv2.addWeighted(cv_image, 0.4, layer, 0.6, 0, cv_image)
-            cv_image = cv2.polylines(
-                cv_image,
-                [mask_array],
-                isClosed=True,
-                color=color,
-                thickness=2,
-                lineType=cv2.LINE_AA,
+        if (
+            hasattr(detection, "mask")
+            and detection.mask.height > 0
+            and len(detection.mask.data) > 0
+        ):
+            mask_array = self.cv_bridge.imgmsg_to_cv2(
+                detection.mask, desired_encoding="mono8"
             )
+            mask_array = np.asarray(mask_array, dtype=np.uint8)
+
+            if np.any(mask_array):
+                layer = np.zeros_like(cv_image)
+                layer[mask_array > 0] = color
+                cv2.addWeighted(cv_image, 0.4, layer, 0.6, 0, cv_image)
         return cv_image
 
-    def draw_keypoints(self, cv_image: np.ndarray, detection: Detection) -> np.ndarray:
+    def draw_keypoints(self, cv_image: np.ndarray, detection) -> np.ndarray:
         """
         Draw keypoints and skeleton on the image.
 
@@ -292,21 +295,21 @@ class DebugNode(LifecycleNode):
         @return Modified image with drawn keypoints and skeleton
         """
 
-        keypoints_msg = detection.keypoints
+        keypoints_msg = detection.pose
 
         ann = Annotator(cv_image)
 
         kp: KeyPoint2D
-        for kp in keypoints_msg.data:
+        for kp in keypoints_msg:
             color_k = (
-                [int(x) for x in ann.kpt_color[kp.id - 1]]
-                if len(keypoints_msg.data) == 17
-                else colors(kp.id - 1)
+                [int(x) for x in ann.kpt_color[kp.id]]
+                if len(keypoints_msg) == 17
+                else colors(kp.id)
             )
 
             cv2.circle(
                 cv_image,
-                (int(kp.point.x), int(kp.point.y)),
+                (int(kp.x), int(kp.y)),
                 5,
                 color_k,
                 -1,
@@ -315,7 +318,7 @@ class DebugNode(LifecycleNode):
             cv2.putText(
                 cv_image,
                 str(kp.id),
-                (int(kp.point.x), int(kp.point.y)),
+                (int(kp.x), int(kp.y)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
                 color_k,
@@ -324,9 +327,9 @@ class DebugNode(LifecycleNode):
             )
 
         def get_pk_pose(kp_id: int) -> Tuple[int]:
-            for kp in keypoints_msg.data:
-                if kp.id == kp_id:
-                    return (int(kp.point.x), int(kp.point.y))
+            for kp in keypoints_msg:
+                if kp.id == kp_id - 1:
+                    return (int(kp.x), int(kp.y))
             return None
 
         for i, sk in enumerate(ann.skeleton):
@@ -345,7 +348,7 @@ class DebugNode(LifecycleNode):
 
         return cv_image
 
-    def create_bb_marker(self, detection: Detection, color: Tuple[int]) -> Marker:
+    def create_bb_marker(self, detection, color: Tuple[int]) -> Marker:
         """
         Create a 3D bounding box marker for RViz visualization.
 
@@ -357,7 +360,7 @@ class DebugNode(LifecycleNode):
         bbox3d = detection.bbox3d
 
         marker = Marker()
-        marker.header.frame_id = bbox3d.frame_id
+        marker.header.frame_id = detection.header.frame_id
 
         marker.ns = "yolo_3d"
         marker.type = Marker.CUBE
@@ -382,7 +385,7 @@ class DebugNode(LifecycleNode):
         marker.color.a = 0.4
 
         marker.lifetime = Duration(seconds=0.5).to_msg()
-        marker.text = detection.class_name
+        marker.text = detection.label
 
         return marker
 
@@ -401,9 +404,9 @@ class DebugNode(LifecycleNode):
         marker.action = Marker.ADD
         marker.frame_locked = False
 
-        marker.pose.position.x = keypoint.point.x
-        marker.pose.position.y = keypoint.point.y
-        marker.pose.position.z = keypoint.point.z
+        marker.pose.position.x = keypoint.x
+        marker.pose.position.y = keypoint.y
+        marker.pose.position.z = keypoint.z
 
         marker.pose.orientation.x = 0.0
         marker.pose.orientation.y = 0.0
@@ -413,9 +416,9 @@ class DebugNode(LifecycleNode):
         marker.scale.y = 0.05
         marker.scale.z = 0.05
 
-        marker.color.r = (1.0 - keypoint.score) * 255.0
+        marker.color.r = 1.0 - keypoint.score
         marker.color.g = 0.0
-        marker.color.b = keypoint.score * 255.0
+        marker.color.b = keypoint.score
         marker.color.a = 0.4
 
         marker.lifetime = Duration(seconds=0.5).to_msg()
@@ -423,7 +426,7 @@ class DebugNode(LifecycleNode):
 
         return marker
 
-    def detections_cb(self, img_msg: Image, detection_msg: DetectionArray) -> None:
+    def detections_cb(self, img_msg: Image, detection_msg) -> None:
         """
         Synchronized callback for image and detections.
 
@@ -437,11 +440,11 @@ class DebugNode(LifecycleNode):
         bb_marker_array = MarkerArray()
         kp_marker_array = MarkerArray()
 
-        detection: Detection
+        detection: Detection2D
         for detection in detection_msg.detections:
 
             # Random color
-            class_name = detection.class_name
+            class_name = detection.label
 
             if class_name not in self._class_to_color:
                 r = random.randint(0, 255)
@@ -455,16 +458,16 @@ class DebugNode(LifecycleNode):
             cv_image = self.draw_mask(cv_image, detection, color)
             cv_image = self.draw_keypoints(cv_image, detection)
 
-            if detection.bbox3d.frame_id:
+            if self.use_3d and detection.bbox3d.size.x > 0:
                 marker = self.create_bb_marker(detection, color)
                 marker.header.stamp = img_msg.header.stamp
                 marker.id = len(bb_marker_array.markers)
                 bb_marker_array.markers.append(marker)
 
-            if detection.keypoints3d.frame_id:
-                for kp in detection.keypoints3d.data:
+            if self.use_3d and detection.pose:
+                for kp in detection.pose:
                     marker = self.create_kp_marker(kp)
-                    marker.header.frame_id = detection.keypoints3d.frame_id
+                    marker.header.frame_id = detection.poses_header.frame_id
                     marker.header.stamp = img_msg.header.stamp
                     marker.id = len(kp_marker_array.markers)
                     kp_marker_array.markers.append(marker)

@@ -15,6 +15,9 @@
 
 
 from typing import List, Dict
+
+import cv2
+import numpy as np
 from cv_bridge import CvBridge
 
 import rclpy
@@ -35,13 +38,10 @@ from ultralytics.engine.results import Keypoints
 
 from std_srvs.srv import SetBool
 from sensor_msgs.msg import Image
-from yolo_msgs.msg import Point2D
-from yolo_msgs.msg import BoundingBox2D
-from yolo_msgs.msg import Mask
-from yolo_msgs.msg import KeyPoint2D
-from yolo_msgs.msg import KeyPoint2DArray
-from yolo_msgs.msg import Detection
-from yolo_msgs.msg import DetectionArray
+from vision_msgs.msg import BoundingBox2D
+from fbot_vision_msgs.msg import Detection2D
+from fbot_vision_msgs.msg import Detection2DArray
+from fbot_vision_msgs.msg import KeyPoint2D
 from yolo_msgs.srv import SetClasses
 
 
@@ -142,7 +142,7 @@ class YoloNode(LifecycleNode):
             depth=1,
         )
 
-        self._pub = self.create_lifecycle_publisher(DetectionArray, "detections", 10)
+        self._pub = self.create_lifecycle_publisher(Detection2DArray, "detections", 10)
         self.cv_bridge = CvBridge()
 
         super().on_configure(state)
@@ -331,8 +331,9 @@ class YoloNode(LifecycleNode):
                 box = box_data.xywh[0]
                 msg.center.position.x = float(box[0])
                 msg.center.position.y = float(box[1])
-                msg.size.x = float(box[2])
-                msg.size.y = float(box[3])
+                msg.center.theta = 0.0
+                msg.size_x = float(box[2])
+                msg.size_y = float(box[3])
 
                 # Append msg
                 boxes_list.append(msg)
@@ -346,15 +347,15 @@ class YoloNode(LifecycleNode):
                 msg.center.position.x = float(box[0])
                 msg.center.position.y = float(box[1])
                 msg.center.theta = float(box[4])
-                msg.size.x = float(box[2])
-                msg.size.y = float(box[3])
+                msg.size_x = float(box[2])
+                msg.size_y = float(box[3])
 
                 # Append msg
                 boxes_list.append(msg)
 
         return boxes_list
 
-    def parse_masks(self, results: Results) -> List[Mask]:
+    def parse_masks(self, results: Results, header) -> List[Image]:
         """
         Parse segmentation masks from YOLO results.
 
@@ -366,44 +367,37 @@ class YoloNode(LifecycleNode):
 
         masks_list = []
 
-        def create_point2d(x: float, y: float) -> Point2D:
-            p = Point2D()
-            p.x = x
-            p.y = y
-            return p
-
         mask: Masks
         for mask in results.masks:
+            mask_image = np.zeros(
+                (results.orig_img.shape[0], results.orig_img.shape[1]), dtype=np.uint8
+            )
+            polygon = np.array(mask.xy[0].tolist(), dtype=np.int32)
+            cv2.fillPoly(mask_image, [polygon], 255)
 
-            msg = Mask()
-
-            msg.data = [
-                create_point2d(float(ele[0]), float(ele[1]))
-                for ele in mask.xy[0].tolist()
-            ]
-            msg.height = results.orig_img.shape[0]
-            msg.width = results.orig_img.shape[1]
+            msg = self.cv_bridge.cv2_to_imgmsg(mask_image, encoding="mono8")
+            msg.header = header
 
             masks_list.append(msg)
 
         return masks_list
 
-    def parse_keypoints(self, results: Results) -> List[KeyPoint2DArray]:
+    def parse_keypoints(self, results: Results) -> List[List[KeyPoint2D]]:
         """
         Parse keypoints from YOLO results.
 
         Extracts keypoint positions and confidence scores, filtering by threshold.
 
         @param results YOLO detection results
-        @return List of KeyPoint2DArray messages
+        @return List of keypoint lists
         """
 
-        keypoints_list = []
+        keypoints_list: List[List[KeyPoint2D]] = []
 
         points: Keypoints
         for points in results.keypoints:
 
-            msg_array = KeyPoint2DArray()
+            msg_array: List[KeyPoint2D] = []
 
             if points.conf is None:
                 continue
@@ -413,12 +407,12 @@ class YoloNode(LifecycleNode):
                 if conf >= self.threshold:
                     msg = KeyPoint2D()
 
-                    msg.id = kp_id + 1
-                    msg.point.x = float(p[0])
-                    msg.point.y = float(p[1])
+                    msg.id = kp_id
+                    msg.x = float(p[0])
+                    msg.y = float(p[1])
                     msg.score = float(conf)
 
-                    msg_array.data.append(msg)
+                    msg_array.append(msg)
 
             keypoints_list.append(msg_array)
 
@@ -460,35 +454,43 @@ class YoloNode(LifecycleNode):
                 boxes = self.parse_boxes(results)
 
             if results.masks:
-                masks = self.parse_masks(results)
+                masks = self.parse_masks(results, msg.header)
 
             if results.keypoints:
                 keypoints = self.parse_keypoints(results)
 
             # Create detection msgs
-            detections_msg = DetectionArray()
+            detections_msg = Detection2DArray()
 
             for i in range(len(results)):
 
-                aux_msg = Detection()
+                aux_msg = Detection2D()
+                aux_msg.header = msg.header
+                aux_msg.id = -1
 
                 if (results.boxes or results.obb) and hypothesis and boxes:
-                    aux_msg.class_id = hypothesis[i]["class_id"]
-                    aux_msg.class_name = hypothesis[i]["class_name"]
+                    aux_msg.class_num = hypothesis[i]["class_id"]
+                    aux_msg.label = hypothesis[i]["class_name"]
                     aux_msg.score = hypothesis[i]["score"]
 
                     aux_msg.bbox = boxes[i]
 
                 if results.masks and masks:
                     aux_msg.mask = masks[i]
+                    aux_msg.type = Detection2D.INSTANCE_SEGMENTATION
 
                 if results.keypoints and keypoints:
-                    aux_msg.keypoints = keypoints[i]
+                    aux_msg.pose = keypoints[i]
+                    aux_msg.type = Detection2D.POSE
+
+                if not aux_msg.type:
+                    aux_msg.type = Detection2D.DETECTION
 
                 detections_msg.detections.append(aux_msg)
 
             # Publish detections
             detections_msg.header = msg.header
+            detections_msg.image_rgb = msg
             self._pub.publish(detections_msg)
 
             del results
