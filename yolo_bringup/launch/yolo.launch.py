@@ -252,6 +252,21 @@ def generate_launch_description():
             description="Point cloud mode: 'rois' = union of detection ROIs, 'full' = entire depth frame",
         )
 
+        sor_pointcloud_use_color = LaunchConfiguration("sor_pointcloud_use_color")
+        sor_pointcloud_use_color_cmd = DeclareLaunchArgument(
+            "sor_pointcloud_use_color",
+            default_value="True",
+            description="If True, publish a coloured XYZRGB cloud by sampling the colour image. "
+                        "Depth processing (SOR) is unaffected.",
+        )
+
+        sor_pointcloud_color_topic = LaunchConfiguration("sor_pointcloud_color_topic")
+        sor_pointcloud_color_topic_cmd = DeclareLaunchArgument(
+            "sor_pointcloud_color_topic",
+            default_value="/femtobolt/depth_registered/points",
+            description="Colour image topic used to sample RGB for the XYZRGB point cloud",
+        )
+
         namespace = LaunchConfiguration("namespace")
         namespace_cmd = DeclareLaunchArgument(
             "namespace",
@@ -337,6 +352,9 @@ def generate_launch_description():
                     # PointCloud2 publication of filtered points
                     "sor_pointcloud_enabled": sor_pointcloud_enabled,
                     "sor_pointcloud_mode": sor_pointcloud_mode,
+                    # Colour (XYZRGB) cloud — independent of depth/SOR processing
+                    "sor_pointcloud_use_color": sor_pointcloud_use_color,
+                    "sor_pointcloud_color_topic": sor_pointcloud_color_topic,
                 }
             ],
             remappings=[
@@ -398,6 +416,8 @@ def generate_launch_description():
             sor_std_dev_mul_cmd,
             sor_pointcloud_enabled_cmd,
             sor_pointcloud_mode_cmd,
+            sor_pointcloud_use_color_cmd,
+            sor_pointcloud_color_topic_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,

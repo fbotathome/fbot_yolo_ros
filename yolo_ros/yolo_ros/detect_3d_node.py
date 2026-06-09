@@ -80,6 +80,12 @@ class Detect3DNode(LifecycleNode):
         #        "full" → process whole depth frame with SOR and publish
         self.declare_parameter("sor_pointcloud_enabled", False)
         self.declare_parameter("sor_pointcloud_mode", "rois")
+        # When True, samples colour from a registered colour image and produces
+        # an XYZRGB cloud. The depth-based SOR processing is unchanged.
+        self.declare_parameter("sor_pointcloud_use_color", False)
+        self.declare_parameter(
+            "sor_pointcloud_color_topic", "/femtobolt/color/image_raw"
+        )
 
         # Auxiliary variables
         self.tf_buffer = Buffer()
@@ -159,6 +165,26 @@ class Detect3DNode(LifecycleNode):
 
         # Accumulator: list of Nx3 float32 arrays, reset each callback (ROI mode)
         self._pending_roi_points: List[np.ndarray] = []
+        # Parallel list of Nx2 int pixel coords for colour sampling (ROI mode)
+        self._pending_roi_coords: List[np.ndarray] = []
+        # Latest colour image (updated by independent subscriber)
+        self._latest_color_image: np.ndarray = None
+
+        # Read colour-cloud parameters
+        self.sor_pointcloud_use_color = (
+            self.get_parameter("sor_pointcloud_use_color")
+            .get_parameter_value()
+            .bool_value
+        )
+        self.sor_pointcloud_color_topic = (
+            self.get_parameter("sor_pointcloud_color_topic")
+            .get_parameter_value()
+            .string_value
+        )
+        self.get_logger().info(
+            f"[{self.get_name()}] Colour cloud: use_color={self.sor_pointcloud_use_color}, "
+            f"topic='{self.sor_pointcloud_color_topic}'"
+        )
 
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -198,6 +224,22 @@ class Detect3DNode(LifecycleNode):
         )
         self._synchronizer.registerCallback(self.on_detections)
 
+        # Colour image subscriber — independent (no sync), stores latest frame
+        if self.sor_pointcloud_enabled and self.sor_pointcloud_use_color:
+            self._color_sub = self.create_subscription(
+                Image,
+                self.sor_pointcloud_color_topic,
+                self._color_image_callback,
+                QoSProfile(
+                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    durability=QoSDurabilityPolicy.VOLATILE,
+                    depth=1,
+                ),
+            )
+        else:
+            self._color_sub = None
+
         super().on_activate(state)
         self.get_logger().info(f"[{self.get_name()}] Activated")
 
@@ -217,6 +259,10 @@ class Detect3DNode(LifecycleNode):
         self.destroy_subscription(self.depth_sub.sub)
         self.destroy_subscription(self.depth_info_sub.sub)
         self.destroy_subscription(self.detections_sub.sub)
+
+        if self._color_sub is not None:
+            self.destroy_subscription(self._color_sub)
+            self._color_sub = None
 
         del self._synchronizer
 
@@ -319,6 +365,7 @@ class Detect3DNode(LifecycleNode):
 
         # Reset per-frame ROI point accumulator
         self._pending_roi_points = []
+        self._pending_roi_coords = []
 
         for detection in detections_msg.detections:
             bbox3d = self.convert_bb_to_3d(depth_image, depth_info_msg, detection)
@@ -357,7 +404,16 @@ class Detect3DNode(LifecycleNode):
             and self._pending_roi_points
         ):
             all_points = np.vstack(self._pending_roi_points)  # (N_total, 3) float32
-            pc2_msg = Detect3DNode._build_pointcloud2(all_points, depth_msg.header)
+
+            if self.sor_pointcloud_use_color and self._latest_color_image is not None:
+                all_coords = np.vstack(self._pending_roi_coords)  # (N_total, 2) int
+                rgb = Detect3DNode._sample_colors(self._latest_color_image, all_coords)
+                pc2_msg = Detect3DNode._build_colored_pointcloud2(
+                    all_points, rgb, depth_msg.header
+                )
+            else:
+                pc2_msg = Detect3DNode._build_pointcloud2(all_points, depth_msg.header)
+
             self._pointcloud_pub.publish(pc2_msg)
 
         return new_detections
@@ -708,6 +764,10 @@ class Detect3DNode(LifecycleNode):
                 self._pending_roi_points.append(
                     np.column_stack([x_pc, y_pc, z_pc])
                 )
+                # Store pixel coords for colour sampling
+                self._pending_roi_coords.append(
+                    valid_coords.astype(np.int32)
+                )
 
         if len(valid_depths) == 0:
             return None
@@ -896,15 +956,135 @@ class Detect3DNode(LifecycleNode):
                 k=self.sor_k_neighbors,
                 std_dev_mul=self.sor_std_dev_mul,
             )
+            # Keep the pixel grid aligned with the surviving points
+            u_flat = u_flat[mask]
+            v_flat = v_flat[mask]
             pts = pts[mask]
 
         if len(pts) == 0:
             return
 
-        pc2_msg = Detect3DNode._build_pointcloud2(
-            pts.astype(np.float32), depth_msg.header
-        )
+        if self.sor_pointcloud_use_color and self._latest_color_image is not None:
+            # Stack (u, v) coords and sample colour
+            coords_full = np.column_stack([u_flat, v_flat]).astype(np.int32)
+            rgb = Detect3DNode._sample_colors(self._latest_color_image, coords_full)
+            pc2_msg = Detect3DNode._build_colored_pointcloud2(
+                pts.astype(np.float32), rgb, depth_msg.header
+            )
+        else:
+            pc2_msg = Detect3DNode._build_pointcloud2(
+                pts.astype(np.float32), depth_msg.header
+            )
         self._pointcloud_pub.publish(pc2_msg)
+
+    @staticmethod
+    def _color_image_callback_placeholder():
+        pass
+
+    def _color_image_callback(self, msg: Image) -> None:
+        """
+        Subscriber callback that caches the latest colour frame for XYZRGB clouds.
+
+        Decodes to BGR8 first (standard OpenCV layout), then converts to RGB so
+        colour sampling stays consistent with sensor_msgs conventions.
+
+        @param msg Latest colour image message
+        """
+        try:
+            bgr = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            self._latest_color_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to decode colour image: {exc}")
+
+    @staticmethod
+    def _sample_colors(
+        color_image: np.ndarray,
+        coords: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Sample RGB values from a colour image at given pixel coordinates.
+
+        Coordinates are clamped to the image boundaries to avoid index errors.
+
+        Args:
+            color_image: HxWx3 uint8 RGB image
+            coords: Nx2 int array of [u (col), v (row)] pixel coordinates
+
+        Returns:
+            Nx3 uint8 array of [R, G, B] values
+        """
+        h, w = color_image.shape[:2]
+        u = np.clip(coords[:, 0].astype(np.int32), 0, w - 1)  # col (x)
+        v = np.clip(coords[:, 1].astype(np.int32), 0, h - 1)  # row (y)
+        return color_image[v, u]  # (N, 3) uint8
+
+    @staticmethod
+    def _build_colored_pointcloud2(
+        points: np.ndarray,
+        rgb: np.ndarray,
+        header,
+    ) -> PointCloud2:
+        """
+        Build a sensor_msgs/PointCloud2 message with XYZRGB fields.
+
+        Follows the pcl::PointXYZRGB convention:
+          offset  0: x  (FLOAT32)
+          offset  4: y  (FLOAT32)
+          offset  8: z  (FLOAT32)
+          offset 12: rgb (FLOAT32 — bits reinterpreted from packed uint32 0xRRGGBB)
+          point_step = 16 bytes
+
+        This layout is natively understood by RViz, PCL, and Open3D.
+
+        Args:
+            points: Nx3 float32 array [X, Y, Z]
+            rgb:    Nx3 uint8  array [R, G, B]
+            header: std_msgs/Header
+
+        Returns:
+            PointCloud2 message ready to publish
+        """
+        points = np.asarray(points, dtype=np.float32)
+        rgb    = np.asarray(rgb,    dtype=np.uint8)
+        n = points.shape[0]
+
+        # Pack RGB into a single uint32: 0x00RRGGBB
+        rgb_packed = (
+            (rgb[:, 0].astype(np.uint32) << 16)
+            | (rgb[:, 1].astype(np.uint32) << 8)
+            |  rgb[:, 2].astype(np.uint32)
+        )  # shape (N,) uint32
+
+        # Reinterpret as float32 (same 4 bytes, different type — PCL convention)
+        rgb_float = rgb_packed.view(np.float32)  # shape (N,) float32
+
+        # Interleave: x, y, z, rgb  — each 4 bytes, row-major
+        data = np.zeros((n, 4), dtype=np.float32)
+        data[:, 0] = points[:, 0]
+        data[:, 1] = points[:, 1]
+        data[:, 2] = points[:, 2]
+        data[:, 3] = rgb_float
+
+        fields = [
+            PointField(name="x",   offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="y",   offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="z",   offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+
+        point_step = 16  # 4 fields × 4 bytes
+
+        msg = PointCloud2()
+        msg.header = header
+        msg.height = 1
+        msg.width = n
+        msg.fields = fields
+        msg.is_bigendian = False
+        msg.point_step = point_step
+        msg.row_step = point_step * n
+        msg.is_dense = True
+        msg.data = list(data.tobytes())
+        return msg
 
     @staticmethod
     def _statistical_outlier_removal(
