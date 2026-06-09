@@ -237,10 +237,18 @@ def generate_launch_description():
             description="SOR standard-deviation multiplier: lower value = more aggressive filtering",
         )
 
+        sor_max_points = LaunchConfiguration("sor_max_points")
+        sor_max_points_cmd = DeclareLaunchArgument(
+            "sor_max_points",
+            default_value="2000",
+            description="Max points sampled for the O(N\u00b2) SOR distance matrix. "
+                        "Lower = faster. 1500-2500 recommended for real-time.",
+        )
+
         sor_pointcloud_enabled = LaunchConfiguration("sor_pointcloud_enabled")
         sor_pointcloud_enabled_cmd = DeclareLaunchArgument(
             "sor_pointcloud_enabled",
-            default_value="True",
+            default_value="False",
             description="Publish SOR-filtered point cloud on /yolo/sor_pointcloud",
         )
 
@@ -256,15 +264,16 @@ def generate_launch_description():
         sor_pointcloud_use_color_cmd = DeclareLaunchArgument(
             "sor_pointcloud_use_color",
             default_value="True",
-            description="If True, publish a coloured XYZRGB cloud by sampling the colour image. "
-                        "Depth processing (SOR) is unaffected.",
+            description="If True, publish a coloured XYZRGB cloud by sampling the registered "
+                        "PointCloud2. Depth/SOR processing is unaffected.",
         )
 
-        sor_pointcloud_color_topic = LaunchConfiguration("sor_pointcloud_color_topic")
-        sor_pointcloud_color_topic_cmd = DeclareLaunchArgument(
-            "sor_pointcloud_color_topic",
+        sor_pointcloud_registered_topic = LaunchConfiguration("sor_pointcloud_registered_topic")
+        sor_pointcloud_registered_topic_cmd = DeclareLaunchArgument(
+            "sor_pointcloud_registered_topic",
             default_value="/femtobolt/depth_registered/points",
-            description="Colour image topic used to sample RGB for the XYZRGB point cloud",
+            description="Registered (colour-aligned) PointCloud2 topic used to sample RGB "
+                        "for the XYZRGB output cloud",
         )
 
         namespace = LaunchConfiguration("namespace")
@@ -349,12 +358,13 @@ def generate_launch_description():
                     "sor_enabled": sor_enabled,
                     "sor_k_neighbors": sor_k_neighbors,
                     "sor_std_dev_mul": sor_std_dev_mul,
+                    "sor_max_points": sor_max_points,
                     # PointCloud2 publication of filtered points
                     "sor_pointcloud_enabled": sor_pointcloud_enabled,
                     "sor_pointcloud_mode": sor_pointcloud_mode,
                     # Colour (XYZRGB) cloud — independent of depth/SOR processing
                     "sor_pointcloud_use_color": sor_pointcloud_use_color,
-                    "sor_pointcloud_color_topic": sor_pointcloud_color_topic,
+                    "sor_pointcloud_registered_topic": sor_pointcloud_registered_topic,
                 }
             ],
             remappings=[
@@ -414,10 +424,11 @@ def generate_launch_description():
             sor_enabled_cmd,
             sor_k_neighbors_cmd,
             sor_std_dev_mul_cmd,
+            sor_max_points_cmd,
             sor_pointcloud_enabled_cmd,
             sor_pointcloud_mode_cmd,
             sor_pointcloud_use_color_cmd,
-            sor_pointcloud_color_topic_cmd,
+            sor_pointcloud_registered_topic_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,

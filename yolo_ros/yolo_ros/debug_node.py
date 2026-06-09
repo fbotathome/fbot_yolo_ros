@@ -384,7 +384,7 @@ class DebugNode(LifecycleNode):
         marker.color.b = color[2] / 255.0
         marker.color.a = 0.4
 
-        marker.lifetime = Duration(seconds=0.5).to_msg()
+        marker.lifetime = Duration(seconds=10).to_msg()
         marker.text = detection.label
 
         return marker

@@ -74,17 +74,24 @@ class Detect3DNode(LifecycleNode):
         self.declare_parameter("sor_enabled", True)
         self.declare_parameter("sor_k_neighbors", 10)
         self.declare_parameter("sor_std_dev_mul", 1.0)
+        # Maximum number of points fed into the O(N²) SOR distance matrix.
+        # Points are randomly sub-sampled ONLY for computing the inlier mask;
+        # the mask is then applied to the full set (no data is thrown away early).
+        # Lower = faster; 1500–2500 is a good range for real-time use.
+        self.declare_parameter("sor_max_points", 2000)
 
         # PointCloud2 publication of SOR-filtered points
         # mode: "rois"  → publish union of all detection ROIs after SOR
         #        "full" → process whole depth frame with SOR and publish
         self.declare_parameter("sor_pointcloud_enabled", False)
         self.declare_parameter("sor_pointcloud_mode", "rois")
-        # When True, samples colour from a registered colour image and produces
-        # an XYZRGB cloud. The depth-based SOR processing is unchanged.
+        # When True, samples colour from an already-registered PointCloud2
+        # (e.g. /femtobolt/depth_registered/points) and outputs an XYZRGB cloud.
+        # The depth-based SOR processing is completely unchanged.
         self.declare_parameter("sor_pointcloud_use_color", False)
         self.declare_parameter(
-            "sor_pointcloud_color_topic", "/femtobolt/color/image_raw"
+            "sor_pointcloud_registered_topic",
+            "/femtobolt/depth_registered/points",
         )
 
         # Auxiliary variables
@@ -146,9 +153,13 @@ class Detect3DNode(LifecycleNode):
         self.sor_std_dev_mul = (
             self.get_parameter("sor_std_dev_mul").get_parameter_value().double_value
         )
+        self.sor_max_points = (
+            self.get_parameter("sor_max_points").get_parameter_value().integer_value
+        )
         self.get_logger().info(
             f"[{self.get_name()}] SOR filter: enabled={self.sor_enabled}, "
-            f"k={self.sor_k_neighbors}, std_mul={self.sor_std_dev_mul}"
+            f"k={self.sor_k_neighbors}, std_mul={self.sor_std_dev_mul}, "
+            f"max_points={self.sor_max_points}"
         )
 
         # Read pointcloud publication parameters
@@ -167,8 +178,10 @@ class Detect3DNode(LifecycleNode):
         self._pending_roi_points: List[np.ndarray] = []
         # Parallel list of Nx2 int pixel coords for colour sampling (ROI mode)
         self._pending_roi_coords: List[np.ndarray] = []
-        # Latest colour image (updated by independent subscriber)
-        self._latest_color_image: np.ndarray = None
+        # Latest registered PointCloud2 (updated by an independent subscriber)
+        self._latest_registered_cloud: PointCloud2 = None
+        # Cached numpy view of the registered cloud data (invalidated on new msg)
+        self._registered_cloud_cache = None  # (data_bytes, point_step, width, rgb_offset)
 
         # Read colour-cloud parameters
         self.sor_pointcloud_use_color = (
@@ -176,14 +189,14 @@ class Detect3DNode(LifecycleNode):
             .get_parameter_value()
             .bool_value
         )
-        self.sor_pointcloud_color_topic = (
-            self.get_parameter("sor_pointcloud_color_topic")
+        self.sor_pointcloud_registered_topic = (
+            self.get_parameter("sor_pointcloud_registered_topic")
             .get_parameter_value()
             .string_value
         )
         self.get_logger().info(
             f"[{self.get_name()}] Colour cloud: use_color={self.sor_pointcloud_use_color}, "
-            f"topic='{self.sor_pointcloud_color_topic}'"
+            f"registered_topic='{self.sor_pointcloud_registered_topic}'"
         )
 
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -224,12 +237,12 @@ class Detect3DNode(LifecycleNode):
         )
         self._synchronizer.registerCallback(self.on_detections)
 
-        # Colour image subscriber — independent (no sync), stores latest frame
+        # Registered PointCloud2 subscriber — independent (no sync), stores latest cloud
         if self.sor_pointcloud_enabled and self.sor_pointcloud_use_color:
             self._color_sub = self.create_subscription(
-                Image,
-                self.sor_pointcloud_color_topic,
-                self._color_image_callback,
+                PointCloud2,
+                self.sor_pointcloud_registered_topic,
+                self._registered_cloud_callback,
                 QoSProfile(
                     reliability=QoSReliabilityPolicy.BEST_EFFORT,
                     history=QoSHistoryPolicy.KEEP_LAST,
@@ -405,9 +418,13 @@ class Detect3DNode(LifecycleNode):
         ):
             all_points = np.vstack(self._pending_roi_points)  # (N_total, 3) float32
 
-            if self.sor_pointcloud_use_color and self._latest_color_image is not None:
+            if self.sor_pointcloud_use_color and self._latest_registered_cloud is not None:
                 all_coords = np.vstack(self._pending_roi_coords)  # (N_total, 2) int
-                rgb = Detect3DNode._sample_colors(self._latest_color_image, all_coords)
+                rgb = Detect3DNode._sample_colors_from_cloud(
+                    self._latest_registered_cloud,
+                    self._registered_cloud_cache,
+                    all_coords,
+                )
                 pc2_msg = Detect3DNode._build_colored_pointcloud2(
                     all_points, rgb, depth_msg.header
                 )
@@ -737,6 +754,7 @@ class Detect3DNode(LifecycleNode):
                     points_3d_sor,
                     k=self.sor_k_neighbors,
                     std_dev_mul=self.sor_std_dev_mul,
+                    max_points=self.sor_max_points,
                 )
 
                 n_removed = int(np.sum(~sor_mask))
@@ -892,7 +910,7 @@ class Detect3DNode(LifecycleNode):
         msg.point_step = point_step
         msg.row_step = point_step * n
         msg.is_dense = True
-        msg.data = list(data)
+        msg.data = bytearray(data)
         return msg
 
     def _publish_full_filtered_pointcloud(
@@ -955,6 +973,7 @@ class Detect3DNode(LifecycleNode):
                 pts,
                 k=self.sor_k_neighbors,
                 std_dev_mul=self.sor_std_dev_mul,
+                max_points=self.sor_max_points,
             )
             # Keep the pixel grid aligned with the surviving points
             u_flat = u_flat[mask]
@@ -964,10 +983,13 @@ class Detect3DNode(LifecycleNode):
         if len(pts) == 0:
             return
 
-        if self.sor_pointcloud_use_color and self._latest_color_image is not None:
-            # Stack (u, v) coords and sample colour
+        if self.sor_pointcloud_use_color and self._latest_registered_cloud is not None:
             coords_full = np.column_stack([u_flat, v_flat]).astype(np.int32)
-            rgb = Detect3DNode._sample_colors(self._latest_color_image, coords_full)
+            rgb = Detect3DNode._sample_colors_from_cloud(
+                self._latest_registered_cloud,
+                self._registered_cloud_cache,
+                coords_full,
+            )
             pc2_msg = Detect3DNode._build_colored_pointcloud2(
                 pts.astype(np.float32), rgb, depth_msg.header
             )
@@ -978,45 +1000,123 @@ class Detect3DNode(LifecycleNode):
         self._pointcloud_pub.publish(pc2_msg)
 
     @staticmethod
-    def _color_image_callback_placeholder():
+    def _registered_cloud_callback_placeholder():
         pass
 
-    def _color_image_callback(self, msg: Image) -> None:
+    def _registered_cloud_callback(self, msg: PointCloud2) -> None:
         """
-        Subscriber callback that caches the latest colour frame for XYZRGB clouds.
+        Subscriber callback that caches the latest registered PointCloud2.
 
-        Decodes to BGR8 first (standard OpenCV layout), then converts to RGB so
-        colour sampling stays consistent with sensor_msgs conventions.
+        The registered cloud is assumed to be *organised* (height × width layout
+        matching the depth image) so that pixel (u, v) maps to flat index
+        v * width + u.  This is the standard output of depth-to-color registration
+        drivers such as the OrbbecSDK ROS wrapper for the Femto Bolt.
 
-        @param msg Latest colour image message
+        The callback also pre-computes the byte offset of the RGB field so the
+        hot-path sampling does not have to re-scan the field list every frame.
+
+        @param msg Registered PointCloud2 message
         """
-        try:
-            bgr = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            self._latest_color_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        except Exception as exc:
-            self.get_logger().warn(f"Failed to decode colour image: {exc}")
+        self._latest_registered_cloud = msg
+
+        # Build / refresh the numpy cache tuple:
+        #   (raw_data np.uint8, point_step, cloud_width, rgb_byte_offset)
+        # Find the RGB field offset once per message (field list rarely changes)
+        rgb_offset = None
+        for field in msg.fields:
+            if field.name.lower() == "rgb":
+                rgb_offset = field.offset
+                break
+        if rgb_offset is None:
+            # Some drivers store separate r / g / b fields
+            r_off = g_off = b_off = None
+            for field in msg.fields:
+                if field.name.lower() == "r":
+                    r_off = field.offset
+                elif field.name.lower() == "g":
+                    g_off = field.offset
+                elif field.name.lower() == "b":
+                    b_off = field.offset
+            self._registered_cloud_cache = (
+                np.frombuffer(bytes(msg.data), dtype=np.uint8),
+                msg.point_step,
+                msg.width,
+                None,          # rgb_offset = None → use separate r/g/b
+                r_off, g_off, b_off,
+            )
+        else:
+            self._registered_cloud_cache = (
+                np.frombuffer(bytes(msg.data), dtype=np.uint8),
+                msg.point_step,
+                msg.width,
+                rgb_offset,    # packed RGB uint32
+                None, None, None,
+            )
 
     @staticmethod
-    def _sample_colors(
-        color_image: np.ndarray,
+    def _sample_colors_from_cloud(
+        cloud_msg: PointCloud2,
+        cache: tuple,
         coords: np.ndarray,
     ) -> np.ndarray:
         """
-        Sample RGB values from a colour image at given pixel coordinates.
+        Extract RGB values from an organised registered PointCloud2 at given pixels.
 
-        Coordinates are clamped to the image boundaries to avoid index errors.
+        Pixel (u=col, v=row) maps to flat point index v * cloud_width + u.
+        The raw bytes of the cloud are indexed directly (zero-copy via numpy
+        frombuffer) using the field offset found in _registered_cloud_callback.
+
+        Supports both packed-RGB (single float32 field named 'rgb') and
+        separate-channel (fields named 'r', 'g', 'b') layouts.
 
         Args:
-            color_image: HxWx3 uint8 RGB image
-            coords: Nx2 int array of [u (col), v (row)] pixel coordinates
+            cloud_msg:  Latest registered PointCloud2 message
+            cache:      Pre-parsed tuple from _registered_cloud_callback, or None
+            coords:     Nx2 int array of [u (col), v (row)] pixel coordinates
 
         Returns:
-            Nx3 uint8 array of [R, G, B] values
+            Nx3 uint8 array of [R, G, B] values (black if cloud unavailable)
         """
-        h, w = color_image.shape[:2]
-        u = np.clip(coords[:, 0].astype(np.int32), 0, w - 1)  # col (x)
-        v = np.clip(coords[:, 1].astype(np.int32), 0, h - 1)  # row (y)
-        return color_image[v, u]  # (N, 3) uint8
+        n = len(coords)
+        fallback = np.zeros((n, 3), dtype=np.uint8)
+
+        if cloud_msg is None or cache is None:
+            return fallback
+
+        data, point_step, cloud_width, rgb_offset, r_off, g_off, b_off = cache
+        cloud_height = cloud_msg.height
+
+        u = np.clip(coords[:, 0].astype(np.int32), 0, cloud_width - 1)
+        v = np.clip(coords[:, 1].astype(np.int32), 0, cloud_height - 1)
+
+        # Flat index of each point in the organised cloud
+        flat_idx = v * cloud_width + u  # (N,)
+        base = flat_idx * point_step    # byte offset of each point in data
+
+        rgb = np.empty((n, 3), dtype=np.uint8)
+
+        if rgb_offset is not None:
+            # Packed uint32 RGB: bytes at base + rgb_offset .. base + rgb_offset + 4
+            # Layout: 0x00RRGGBB (byte order: B, G, R, pad on little-endian)
+            # Index the 4 bytes for every point simultaneously
+            b_idx = base + rgb_offset        # blue byte index (LSB)
+            packed = (
+                data[b_idx].astype(np.uint32)
+                | (data[b_idx + 1].astype(np.uint32) << 8)
+                | (data[b_idx + 2].astype(np.uint32) << 16)
+            )
+            rgb[:, 0] = (packed >> 16) & 0xFF  # R
+            rgb[:, 1] = (packed >> 8)  & 0xFF  # G
+            rgb[:, 2] =  packed        & 0xFF  # B
+        elif r_off is not None and g_off is not None and b_off is not None:
+            # Separate uint8 r / g / b fields
+            rgb[:, 0] = data[base + r_off]
+            rgb[:, 1] = data[base + g_off]
+            rgb[:, 2] = data[base + b_off]
+        else:
+            return fallback
+
+        return rgb
 
     @staticmethod
     def _build_colored_pointcloud2(
@@ -1083,7 +1183,7 @@ class Detect3DNode(LifecycleNode):
         msg.point_step = point_step
         msg.row_step = point_step * n
         msg.is_dense = True
-        msg.data = list(data.tobytes())
+        msg.data = bytearray(data.tobytes())
         return msg
 
     @staticmethod
@@ -1091,6 +1191,7 @@ class Detect3DNode(LifecycleNode):
         points_3d: np.ndarray,
         k: int = 10,
         std_dev_mul: float = 1.0,
+        max_points: int = 2000,
     ) -> np.ndarray:
         """
         Statistical Outlier Removal (SOR) implemented in numpy.
@@ -1100,13 +1201,17 @@ class Detect3DNode(LifecycleNode):
         Points whose mean distance exceeds (global_mean + std_dev_mul * global_std)
         are marked as outliers.
 
-        Particularly effective against ghost points generated by ToF Edge Bleeding
-        and Multi-path interference on sensors such as the Femto Bolt.
+        When the point count exceeds max_points, a random sub-sample of
+        max_points is used to compute the per-point mean distances (keeping the
+        O(N²) matrix bounded in size), and the resulting inlier decision is
+        propagated back to the full point set via nearest-neighbour lookup on
+        the sample.  This keeps accuracy high while bounding latency.
 
         Args:
-            points_3d: Nx3 array of 3D points [X, Y, Z] in metres
-            k: Number of nearest neighbours to consider
+            points_3d:  Nx3 array of 3D points [X, Y, Z] in metres
+            k:          Number of nearest neighbours to consider
             std_dev_mul: Standard-deviation multiplier; lower = more aggressive
+            max_points: Hard cap on N before downsampling (default 2000)
 
         Returns:
             Boolean mask of length N (True = inlier, False = outlier)
@@ -1117,30 +1222,52 @@ class Detect3DNode(LifecycleNode):
         if n < max(4, k + 1):
             return np.ones(n, dtype=bool)
 
-        k_actual = min(k, n - 1)
+        # ── Downsampling for O(N²) cost control ──────────────────────────────
+        if n > max_points:
+            # Random sample indices (reproducible within a frame via fixed seed)
+            rng = np.random.default_rng(seed=0)
+            sample_idx = rng.choice(n, size=max_points, replace=False)
+            sample = points_3d[sample_idx]  # (max_points, 3)
+        else:
+            sample_idx = None
+            sample = points_3d
 
-        # Squared pairwise distances via broadcasting: shape (N, N)
-        diff = points_3d[:, np.newaxis, :] - points_3d[np.newaxis, :, :]  # (N, N, 3)
-        dist_sq = np.sum(diff ** 2, axis=2)  # (N, N)
+        ns = len(sample)
+        k_actual = min(k, ns - 1)
 
-        # For each point, retrieve the k smallest distances (excluding self = 0)
-        # np.partition is O(N * k) — much faster than full sort when k << N
+        # ── Pairwise O(ns²) distance matrix ───────────────────────────────────
+        diff    = sample[:, np.newaxis, :] - sample[np.newaxis, :, :]  # (ns,ns,3)
+        dist_sq = np.sum(diff ** 2, axis=2)                            # (ns,ns)
+
+        # k nearest neighbours (excluding self)
         partitioned = np.partition(dist_sq, k_actual + 1, axis=1)[:, 1 : k_actual + 1]
+        mean_dist_sample = np.mean(np.sqrt(np.maximum(partitioned, 0.0)), axis=1)  # (ns,)
 
-        # Mean Euclidean distance to the k nearest neighbours for each point
-        mean_dist = np.mean(np.sqrt(np.maximum(partitioned, 0.0)), axis=1)  # (N,)
+        # Global threshold
+        global_mean = np.mean(mean_dist_sample)
+        global_std  = np.std(mean_dist_sample)
+        threshold   = global_mean + std_dev_mul * global_std
 
-        # Global statistics to define the acceptance threshold
-        global_mean = np.mean(mean_dist)
-        global_std = np.std(mean_dist)
-        threshold = global_mean + std_dev_mul * global_std
-
-        inlier_mask = mean_dist <= threshold
+        if sample_idx is None:
+            # No downsampling: mask is directly from the sample
+            inlier_mask = mean_dist_sample <= threshold
+        else:
+            # ── Propagate decision to full set ─────────────────────────────
+            # For every point in the full set, find its nearest sample point
+            # and inherit that sample's inlier/outlier label.
+            # Cost: O(N * ns) — linear in N for fixed ns = max_points.
+            diff_full = points_3d[:, np.newaxis, :] - sample[np.newaxis, :, :]  # (N,ns,3)
+            dist_full = np.sum(diff_full ** 2, axis=2)                           # (N,ns)
+            nearest   = np.argmin(dist_full, axis=1)                             # (N,)
+            sample_inlier = mean_dist_sample <= threshold                        # (ns,)
+            inlier_mask   = sample_inlier[nearest]                               # (N,)
 
         # Safety fallback: always keep at least 30 % of points
         min_keep = max(4, int(n * 0.30))
         if int(np.sum(inlier_mask)) < min_keep:
-            sorted_idx = np.argsort(mean_dist)
+            sorted_idx  = np.argsort(
+                mean_dist_sample[nearest] if sample_idx is not None else mean_dist_sample
+            )
             inlier_mask = np.zeros(n, dtype=bool)
             inlier_mask[sorted_idx[:min_keep]] = True
 
