@@ -216,6 +216,42 @@ def generate_launch_description():
             description="Divisor used to convert the raw depth image values into metres",
         )
 
+        sor_enabled = LaunchConfiguration("sor_enabled")
+        sor_enabled_cmd = DeclareLaunchArgument(
+            "sor_enabled",
+            default_value="True",
+            description="Enable Statistical Outlier Removal to fix ToF Edge Bleeding / Multi-path artifacts",
+        )
+
+        sor_k_neighbors = LaunchConfiguration("sor_k_neighbors")
+        sor_k_neighbors_cmd = DeclareLaunchArgument(
+            "sor_k_neighbors",
+            default_value="10",
+            description="Number of k nearest neighbours used by the SOR filter",
+        )
+
+        sor_std_dev_mul = LaunchConfiguration("sor_std_dev_mul")
+        sor_std_dev_mul_cmd = DeclareLaunchArgument(
+            "sor_std_dev_mul",
+            default_value="1.0",
+            description="SOR standard-deviation multiplier: lower value = more aggressive filtering",
+        )
+
+        sor_pointcloud_enabled = LaunchConfiguration("sor_pointcloud_enabled")
+        sor_pointcloud_enabled_cmd = DeclareLaunchArgument(
+            "sor_pointcloud_enabled",
+            default_value="True",
+            description="Publish SOR-filtered point cloud on /yolo/sor_pointcloud",
+        )
+
+        sor_pointcloud_mode = LaunchConfiguration("sor_pointcloud_mode")
+        sor_pointcloud_mode_cmd = DeclareLaunchArgument(
+            "sor_pointcloud_mode",
+            default_value="rois",
+            choices=["rois", "full"],
+            description="Point cloud mode: 'rois' = union of detection ROIs, 'full' = entire depth frame",
+        )
+
         namespace = LaunchConfiguration("namespace")
         namespace_cmd = DeclareLaunchArgument(
             "namespace",
@@ -294,6 +330,13 @@ def generate_launch_description():
                     "depth_image_units_divisor": depth_image_units_divisor,
                     "depth_image_reliability": depth_image_reliability,
                     "depth_info_reliability": depth_info_reliability,
+                    # Statistical Outlier Removal — fixes ToF Edge Bleeding
+                    "sor_enabled": sor_enabled,
+                    "sor_k_neighbors": sor_k_neighbors,
+                    "sor_std_dev_mul": sor_std_dev_mul,
+                    # PointCloud2 publication of filtered points
+                    "sor_pointcloud_enabled": sor_pointcloud_enabled,
+                    "sor_pointcloud_mode": sor_pointcloud_mode,
                 }
             ],
             remappings=[
@@ -350,6 +393,11 @@ def generate_launch_description():
             depth_image_units_divisor_cmd,
             namespace_cmd,
             use_debug_cmd,
+            sor_enabled_cmd,
+            sor_k_neighbors_cmd,
+            sor_std_dev_mul_cmd,
+            sor_pointcloud_enabled_cmd,
+            sor_pointcloud_mode_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,

@@ -33,7 +33,8 @@ from tf2_ros.buffer import Buffer
 from tf2_ros import TransformException
 from tf2_ros.transform_listener import TransformListener
 
-from sensor_msgs.msg import CameraInfo, Image
+import struct
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from geometry_msgs.msg import TransformStamped
 from vision_msgs.msg import BoundingBox3D
 from fbot_vision_msgs.msg import Detection2D
@@ -67,6 +68,18 @@ class Detect3DNode(LifecycleNode):
             "depth_image_reliability", QoSReliabilityPolicy.BEST_EFFORT
         )
         self.declare_parameter("depth_info_reliability", QoSReliabilityPolicy.BEST_EFFORT)
+
+        # Statistical Outlier Removal (SOR) parameters
+        # Removes ToF Edge Bleeding / Multi-path ghost points before bbox computation
+        self.declare_parameter("sor_enabled", True)
+        self.declare_parameter("sor_k_neighbors", 10)
+        self.declare_parameter("sor_std_dev_mul", 1.0)
+
+        # PointCloud2 publication of SOR-filtered points
+        # mode: "rois"  → publish union of all detection ROIs after SOR
+        #        "full" → process whole depth frame with SOR and publish
+        self.declare_parameter("sor_pointcloud_enabled", False)
+        self.declare_parameter("sor_pointcloud_mode", "rois")
 
         # Auxiliary variables
         self.tf_buffer = Buffer()
@@ -116,10 +129,42 @@ class Detect3DNode(LifecycleNode):
             durability=QoSDurabilityPolicy.VOLATILE,
             depth=1,
         )
+
+        # Read SOR parameters
+        self.sor_enabled = (
+            self.get_parameter("sor_enabled").get_parameter_value().bool_value
+        )
+        self.sor_k_neighbors = (
+            self.get_parameter("sor_k_neighbors").get_parameter_value().integer_value
+        )
+        self.sor_std_dev_mul = (
+            self.get_parameter("sor_std_dev_mul").get_parameter_value().double_value
+        )
+        self.get_logger().info(
+            f"[{self.get_name()}] SOR filter: enabled={self.sor_enabled}, "
+            f"k={self.sor_k_neighbors}, std_mul={self.sor_std_dev_mul}"
+        )
+
+        # Read pointcloud publication parameters
+        self.sor_pointcloud_enabled = (
+            self.get_parameter("sor_pointcloud_enabled").get_parameter_value().bool_value
+        )
+        self.sor_pointcloud_mode = (
+            self.get_parameter("sor_pointcloud_mode").get_parameter_value().string_value
+        )
+        self.get_logger().info(
+            f"[{self.get_name()}] PointCloud pub: enabled={self.sor_pointcloud_enabled}, "
+            f"mode='{self.sor_pointcloud_mode}'"
+        )
+
+        # Accumulator: list of Nx3 float32 arrays, reset each callback (ROI mode)
+        self._pending_roi_points: List[np.ndarray] = []
+
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Pubs
         self._pub = self.create_publisher(Detection3DArray, "detections_3d", 10)
+        self._pointcloud_pub = self.create_publisher(PointCloud2, "sor_pointcloud", 10)
 
         super().on_configure(state)
         self.get_logger().info(f"[{self.get_name()}] Configured")
@@ -236,6 +281,10 @@ class Detect3DNode(LifecycleNode):
         )
         self._pub.publish(new_detections_msg)
 
+        # Publish SOR-filtered point cloud in "full" mode
+        if self.sor_pointcloud_enabled and self.sor_pointcloud_mode == "full":
+            self._publish_full_filtered_pointcloud(depth_msg, depth_info_msg)
+
     def process_detections(
         self,
         depth_msg: Image,
@@ -268,6 +317,9 @@ class Detect3DNode(LifecycleNode):
             depth_msg, desired_encoding="passthrough"
         )
 
+        # Reset per-frame ROI point accumulator
+        self._pending_roi_points = []
+
         for detection in detections_msg.detections:
             bbox3d = self.convert_bb_to_3d(depth_image, depth_info_msg, detection)
 
@@ -297,6 +349,16 @@ class Detect3DNode(LifecycleNode):
                     new_detection.pose = keypoints3d
 
                 new_detections.append(new_detection)
+
+        # Publish combined ROI point cloud after processing all detections
+        if (
+            self.sor_pointcloud_enabled
+            and self.sor_pointcloud_mode == "rois"
+            and self._pending_roi_points
+        ):
+            all_points = np.vstack(self._pending_roi_points)  # (N_total, 3) float32
+            pc2_msg = Detect3DNode._build_pointcloud2(all_points, depth_msg.header)
+            self._pointcloud_pub.publish(pc2_msg)
 
         return new_detections
 
@@ -599,6 +661,54 @@ class Detect3DNode(LifecycleNode):
         valid_depths = valid_depths[valid_mask]
         valid_coords = pixel_coords[valid_mask]
 
+        # ── Statistical Outlier Removal (SOR) ─────────────────────────────────
+        # Removes ghost points caused by ToF Edge Bleeding and Multi-path.
+        # Reconstructs temporary 3D points (meters) and filters those whose
+        # mean distance to k nearest neighbours exceeds mean + std_mul * std.
+        if self.sor_enabled and len(valid_depths) >= 4:
+            k_cam = depth_info.k
+            px_cam, py_cam = k_cam[2], k_cam[5]
+            fx_cam, fy_cam = k_cam[0], k_cam[4]
+
+            if fx_cam != 0 and fy_cam != 0:
+                u_pix = valid_coords[:, 0].astype(np.float64)
+                v_pix = valid_coords[:, 1].astype(np.float64)
+                x_3d_sor = valid_depths * (u_pix - px_cam) / fx_cam
+                y_3d_sor = valid_depths * (v_pix - py_cam) / fy_cam
+                points_3d_sor = np.column_stack([x_3d_sor, y_3d_sor, valid_depths])
+
+                sor_mask = Detect3DNode._statistical_outlier_removal(
+                    points_3d_sor,
+                    k=self.sor_k_neighbors,
+                    std_dev_mul=self.sor_std_dev_mul,
+                )
+
+                n_removed = int(np.sum(~sor_mask))
+                if n_removed > 0:
+                    self.get_logger().debug(
+                        f"SOR removed {n_removed}/{len(sor_mask)} outlier points"
+                    )
+
+                valid_depths = valid_depths[sor_mask]
+                valid_coords = valid_coords[sor_mask]
+        # ──────────────────────────────────────────────────────────────────────
+
+        # Accumulate 3D inlier points for PointCloud2 publication (ROI mode).
+        # Uses the final valid_depths/valid_coords after all filtering.
+        if self.sor_pointcloud_enabled and self.sor_pointcloud_mode == "rois" and len(valid_depths) > 0:
+            k_pc = depth_info.k
+            px_pc, py_pc = k_pc[2], k_pc[5]
+            fx_pc, fy_pc = k_pc[0], k_pc[4]
+            if fx_pc != 0 and fy_pc != 0:
+                u_pc = valid_coords[:, 0].astype(np.float32)
+                v_pc = valid_coords[:, 1].astype(np.float32)
+                z_pc = valid_depths.astype(np.float32)
+                x_pc = z_pc * (u_pc - float(px_pc)) / float(fx_pc)
+                y_pc = z_pc * (v_pc - float(py_pc)) / float(fy_pc)
+                self._pending_roi_points.append(
+                    np.column_stack([x_pc, y_pc, z_pc])
+                )
+
         if len(valid_depths) == 0:
             return None
 
@@ -682,6 +792,179 @@ class Detect3DNode(LifecycleNode):
         weights = np.maximum(weights, 0.3)
 
         return weights
+
+    @staticmethod
+    def _build_pointcloud2(
+        points: np.ndarray,
+        header,
+    ) -> PointCloud2:
+        """
+        Build a sensor_msgs/PointCloud2 message from an Nx3 float32 array.
+
+        Encodes XYZ as three consecutive IEEE-754 float32 values per point
+        (matches the standard 'pcl::PointXYZ' binary layout).
+
+        Args:
+            points: Nx3 numpy array of [X, Y, Z] in metres (float32)
+            header: std_msgs/Header to stamp the message
+
+        Returns:
+            PointCloud2 message ready to publish
+        """
+        points = np.asarray(points, dtype=np.float32)
+        n = points.shape[0]
+
+        fields = [
+            PointField(name="x", offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8,  datatype=PointField.FLOAT32, count=1),
+        ]
+
+        point_step = 12  # 3 × 4 bytes
+        data = points.tobytes()
+
+        msg = PointCloud2()
+        msg.header = header
+        msg.height = 1
+        msg.width = n
+        msg.fields = fields
+        msg.is_bigendian = False
+        msg.point_step = point_step
+        msg.row_step = point_step * n
+        msg.is_dense = True
+        msg.data = list(data)
+        return msg
+
+    def _publish_full_filtered_pointcloud(
+        self,
+        depth_msg: Image,
+        depth_info_msg: CameraInfo,
+    ) -> None:
+        """
+        Process the entire depth frame with SOR and publish the filtered
+        point cloud on the 'sor_pointcloud' topic.
+
+        This is the "full" mode counterpart to the per-ROI accumulator used
+        in "rois" mode. It sub-samples rows/cols by 2 before SOR to keep
+        latency manageable for full VGA/HD depth images.
+
+        @param depth_msg Depth image message
+        @param depth_info_msg Camera intrinsics
+        """
+        try:
+            depth_image = self.cv_bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding="passthrough"
+            )
+        except Exception:
+            return
+
+        k = depth_info_msg.k
+        px, py = float(k[2]), float(k[5])
+        fx, fy = float(k[0]), float(k[4])
+
+        if fx == 0 or fy == 0:
+            return
+
+        # Sub-sample every 2nd pixel to reduce N² cost of SOR
+        depth_sub = depth_image[::2, ::2].astype(np.float64)
+        depth_sub = depth_sub / self.depth_image_units_divisor  # → metres
+
+        rows, cols = depth_sub.shape
+        v_grid, u_grid = np.meshgrid(
+            np.arange(rows) * 2, np.arange(cols) * 2, indexing="ij"
+        )
+
+        z_flat = depth_sub.flatten()
+        u_flat = u_grid.flatten().astype(np.float64)
+        v_flat = v_grid.flatten().astype(np.float64)
+
+        valid = (z_flat > 0) & np.isfinite(z_flat)
+        z_flat = z_flat[valid]
+        u_flat = u_flat[valid]
+        v_flat = v_flat[valid]
+
+        if len(z_flat) == 0:
+            return
+
+        x_flat = z_flat * (u_flat - px) / fx
+        y_flat = z_flat * (v_flat - py) / fy
+        pts = np.column_stack([x_flat, y_flat, z_flat])
+
+        if self.sor_enabled and len(pts) >= 4:
+            mask = Detect3DNode._statistical_outlier_removal(
+                pts,
+                k=self.sor_k_neighbors,
+                std_dev_mul=self.sor_std_dev_mul,
+            )
+            pts = pts[mask]
+
+        if len(pts) == 0:
+            return
+
+        pc2_msg = Detect3DNode._build_pointcloud2(
+            pts.astype(np.float32), depth_msg.header
+        )
+        self._pointcloud_pub.publish(pc2_msg)
+
+    @staticmethod
+    def _statistical_outlier_removal(
+        points_3d: np.ndarray,
+        k: int = 10,
+        std_dev_mul: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Statistical Outlier Removal (SOR) implemented in numpy.
+
+        Replicates the pcl::StatisticalOutlierRemoval algorithm:
+        for each point, computes the mean distance to its k nearest neighbours.
+        Points whose mean distance exceeds (global_mean + std_dev_mul * global_std)
+        are marked as outliers.
+
+        Particularly effective against ghost points generated by ToF Edge Bleeding
+        and Multi-path interference on sensors such as the Femto Bolt.
+
+        Args:
+            points_3d: Nx3 array of 3D points [X, Y, Z] in metres
+            k: Number of nearest neighbours to consider
+            std_dev_mul: Standard-deviation multiplier; lower = more aggressive
+
+        Returns:
+            Boolean mask of length N (True = inlier, False = outlier)
+        """
+        n = len(points_3d)
+
+        # Not enough points to filter — keep everything
+        if n < max(4, k + 1):
+            return np.ones(n, dtype=bool)
+
+        k_actual = min(k, n - 1)
+
+        # Squared pairwise distances via broadcasting: shape (N, N)
+        diff = points_3d[:, np.newaxis, :] - points_3d[np.newaxis, :, :]  # (N, N, 3)
+        dist_sq = np.sum(diff ** 2, axis=2)  # (N, N)
+
+        # For each point, retrieve the k smallest distances (excluding self = 0)
+        # np.partition is O(N * k) — much faster than full sort when k << N
+        partitioned = np.partition(dist_sq, k_actual + 1, axis=1)[:, 1 : k_actual + 1]
+
+        # Mean Euclidean distance to the k nearest neighbours for each point
+        mean_dist = np.mean(np.sqrt(np.maximum(partitioned, 0.0)), axis=1)  # (N,)
+
+        # Global statistics to define the acceptance threshold
+        global_mean = np.mean(mean_dist)
+        global_std = np.std(mean_dist)
+        threshold = global_mean + std_dev_mul * global_std
+
+        inlier_mask = mean_dist <= threshold
+
+        # Safety fallback: always keep at least 30 % of points
+        min_keep = max(4, int(n * 0.30))
+        if int(np.sum(inlier_mask)) < min_keep:
+            sorted_idx = np.argsort(mean_dist)
+            inlier_mask = np.zeros(n, dtype=bool)
+            inlier_mask[sorted_idx[:min_keep]] = True
+
+        return inlier_mask
 
     @staticmethod
     def _compute_height_bounds(
