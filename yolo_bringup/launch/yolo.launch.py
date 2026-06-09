@@ -175,7 +175,7 @@ def generate_launch_description():
         input_depth_topic = LaunchConfiguration("input_depth_topic")
         input_depth_topic_cmd = DeclareLaunchArgument(
             "input_depth_topic",
-            default_value="/femtobolt/depth/image_unaligned",
+            default_value="/femtobolt/depth/image_raw",
             description="Name of the input depth topic",
         )
 

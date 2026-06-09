@@ -553,17 +553,14 @@ class Detect3DNode(LifecycleNode):
             and detection.mask.width > 0
             and len(detection.mask.data) > 0
         ):
-            # Crop depth image by mask
             mask_image = self.cv_bridge.imgmsg_to_cv2(
                 detection.mask, desired_encoding="mono8"
             )
             mask = np.asarray(mask_image, dtype=np.uint8)
-            roi = cv2.bitwise_and(depth_image, depth_image, mask=mask)
-
-            # Get pixel coordinates for spatial weighting
             y_coords, x_coords = np.where(mask > 0)
             pixel_coords = np.column_stack([x_coords, y_coords])
-
+            # Extrai apenas os valores de depth onde a máscara é válida
+            roi = depth_image[y_coords, x_coords].astype(np.float64)
         else:
             # Crop depth image by the 2D BB
             u_min = max(center_x - size_x // 2, 0)
