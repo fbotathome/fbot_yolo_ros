@@ -216,6 +216,48 @@ def generate_launch_description():
             description="Divisor used to convert the raw depth image values into metres",
         )
 
+        enable_foreground_filter = LaunchConfiguration("enable_foreground_filter")
+        enable_foreground_filter_cmd = DeclareLaunchArgument(
+            "enable_foreground_filter",
+            default_value="True",
+            description="Enable mask erosion and foreground depth filtering",
+        )
+
+        enable_bimodal_filter = LaunchConfiguration("enable_bimodal_filter")
+        enable_bimodal_filter_cmd = DeclareLaunchArgument(
+            "enable_bimodal_filter",
+            default_value="True",
+            description="Enable bimodal depth background suppression",
+        )
+
+        mask_erosion_ratio = LaunchConfiguration("mask_erosion_ratio")
+        mask_erosion_ratio_cmd = DeclareLaunchArgument(
+            "mask_erosion_ratio",
+            default_value="0.08",
+            description="Fraction of the mask size used for erosion",
+        )
+
+        bimodal_min_gap = LaunchConfiguration("bimodal_min_gap")
+        bimodal_min_gap_cmd = DeclareLaunchArgument(
+            "bimodal_min_gap",
+            default_value="0.08",
+            description="Minimum depth gap to consider two peaks as bimodal",
+        )
+
+        max_depth_extent_default = LaunchConfiguration("max_depth_extent_default")
+        max_depth_extent_default_cmd = DeclareLaunchArgument(
+            "max_depth_extent_default",
+            default_value="0.60",
+            description="Maximum expected depth extent for unknown classes",
+        )
+
+        max_depth_extent_bottle = LaunchConfiguration("max_depth_extent_bottle")
+        max_depth_extent_bottle_cmd = DeclareLaunchArgument(
+            "max_depth_extent_bottle",
+            default_value="0.15",
+            description="Maximum expected depth extent for bottles",
+        )
+
         namespace = LaunchConfiguration("namespace")
         namespace_cmd = DeclareLaunchArgument(
             "namespace",
@@ -294,6 +336,12 @@ def generate_launch_description():
                     "depth_image_units_divisor": depth_image_units_divisor,
                     "depth_image_reliability": depth_image_reliability,
                     "depth_info_reliability": depth_info_reliability,
+                    "enable_foreground_filter": enable_foreground_filter,
+                    "enable_bimodal_filter": enable_bimodal_filter,
+                    "mask_erosion_ratio": mask_erosion_ratio,
+                    "bimodal_min_gap": bimodal_min_gap,
+                    "max_depth_extent_default": max_depth_extent_default,
+                    "max_depth_extent_bottle": max_depth_extent_bottle,
                 }
             ],
             remappings=[
@@ -348,6 +396,12 @@ def generate_launch_description():
             depth_info_reliability_cmd,
             target_frame_cmd,
             depth_image_units_divisor_cmd,
+            enable_foreground_filter_cmd,
+            enable_bimodal_filter_cmd,
+            mask_erosion_ratio_cmd,
+            bimodal_min_gap_cmd,
+            max_depth_extent_default_cmd,
+            max_depth_extent_bottle_cmd,
             namespace_cmd,
             use_debug_cmd,
             yolo_node_cmd,

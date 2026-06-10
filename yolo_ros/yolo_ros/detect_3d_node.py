@@ -67,6 +67,16 @@ class Detect3DNode(LifecycleNode):
             "depth_image_reliability", QoSReliabilityPolicy.BEST_EFFORT
         )
         self.declare_parameter("depth_info_reliability", QoSReliabilityPolicy.BEST_EFFORT)
+        self.declare_parameter("enable_foreground_filter", True)
+        self.declare_parameter("enable_bimodal_filter", True)
+        self.declare_parameter("mask_erosion_ratio", 0.08)
+        self.declare_parameter("bimodal_min_gap", 0.08)
+        self.declare_parameter("max_depth_extent_default", 0.60)
+        self.declare_parameter("max_depth_extent_bottle", 0.15)
+        self.declare_parameter("max_depth_extent_cup", 0.12)
+        self.declare_parameter("max_depth_extent_can", 0.10)
+        self.declare_parameter("max_depth_extent_person", 0.55)
+        self.declare_parameter("max_depth_extent_chair", 0.60)
 
         # Auxiliary variables
         self.tf_buffer = Buffer()
@@ -117,6 +127,60 @@ class Detect3DNode(LifecycleNode):
             depth=1,
         )
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.enable_foreground_filter = (
+            self.get_parameter("enable_foreground_filter")
+            .get_parameter_value()
+            .bool_value
+        )
+        self.enable_bimodal_filter = (
+            self.get_parameter("enable_bimodal_filter")
+            .get_parameter_value()
+            .bool_value
+        )
+        self.mask_erosion_ratio = (
+            self.get_parameter("mask_erosion_ratio").get_parameter_value().double_value
+        )
+        self.bimodal_min_gap = (
+            self.get_parameter("bimodal_min_gap").get_parameter_value().double_value
+        )
+        self.depth_extent_limits = {
+            "bottle": (
+                0.03,
+                self.get_parameter("max_depth_extent_bottle")
+                .get_parameter_value()
+                .double_value,
+            ),
+            "cup": (
+                0.03,
+                self.get_parameter("max_depth_extent_cup")
+                .get_parameter_value()
+                .double_value,
+            ),
+            "can": (
+                0.03,
+                self.get_parameter("max_depth_extent_can")
+                .get_parameter_value()
+                .double_value,
+            ),
+            "person": (
+                0.10,
+                self.get_parameter("max_depth_extent_person")
+                .get_parameter_value()
+                .double_value,
+            ),
+            "chair": (
+                0.05,
+                self.get_parameter("max_depth_extent_chair")
+                .get_parameter_value()
+                .double_value,
+            ),
+            "default": (
+                0.01,
+                self.get_parameter("max_depth_extent_default")
+                .get_parameter_value()
+                .double_value,
+            ),
+        }
 
         # Pubs
         self._pub = self.create_publisher(Detection3DArray, "detections_3d", 10)
@@ -568,7 +632,7 @@ class Detect3DNode(LifecycleNode):
             v_min = max(center_y - size_y // 2, 0)
             v_max = min(center_y + size_y // 2, depth_image.shape[0] - 1)
 
-            roi = depth_image[v_min:v_max, u_min:u_max]
+            roi = depth_image[v_min : v_max + 1, u_min : u_max + 1]
 
             # Generate pixel coordinates for spatial weighting
             roi_h, roi_w = roi.shape
@@ -602,23 +666,71 @@ class Detect3DNode(LifecycleNode):
         if len(valid_depths) == 0:
             return None
 
+        if (
+            detection.mask.height > 0
+            and detection.mask.width > 0
+            and len(detection.mask.data) > 0
+            and self.enable_foreground_filter
+        ):
+            eroded_mask = self._erode_mask(mask, self.mask_erosion_ratio)
+            ey, ex = np.where(eroded_mask > 0)
+            if len(ey) >= 10:
+                eroded_depths = depth_image[ey, ex].astype(np.float64)
+                eroded_depths = eroded_depths / self.depth_image_units_divisor
+                eroded_coords = np.column_stack([ex, ey])
+                eroded_valid = (eroded_depths > 0) & np.isfinite(eroded_depths)
+                if np.sum(eroded_valid) >= 10:
+                    valid_depths = eroded_depths[eroded_valid]
+                    valid_coords = eroded_coords[eroded_valid]
+
         # Compute spatial weights based on distance from 2D bbox center
         # Pixels closer to center are more likely to be the actual object
         spatial_weights = self._compute_spatial_weights(
             valid_coords, center_x, center_y, size_x, size_y
         )
 
+        full_depths = valid_depths.copy()
+        full_coords = valid_coords.copy()
+        full_weights = spatial_weights.copy()
+
+        z_depths = valid_depths.copy()
+        z_coords = valid_coords.copy()
+        z_weights = spatial_weights.copy()
+        if self.enable_foreground_filter:
+            z_depths, z_coords, z_weights = self._filter_foreground_depths(
+                z_depths,
+                z_coords,
+                z_weights,
+                max_object_depth_extent=self._get_max_depth_extent(detection.label),
+            )
+
+        if self.enable_bimodal_filter:
+            z_depths, z_coords, z_weights = self._detect_and_remove_background_mode(
+                z_depths,
+                z_coords,
+                z_weights,
+                min_gap_meters=self.bimodal_min_gap,
+            )
+
+        if len(z_depths) == 0:
+            return None
+
         # Compute robust depth statistics with spatial weighting
         z, z_min, z_max = Detect3DNode._compute_depth_bounds_weighted(
-            valid_depths, spatial_weights
+            z_depths, z_weights
         )
 
         if not np.isfinite(z) or z == 0:
             return None
 
+        if not self._validate_bbox3d_extent(
+            z, z_min, z_max, detection.label, self.depth_extent_limits
+        ):
+            return None
+
         # Compute height (y-axis) statistics from actual 3D points
         y_center, y_min, y_max = Detect3DNode._compute_height_bounds(
-            valid_coords, valid_depths, spatial_weights, depth_info
+            full_coords, full_depths, full_weights, depth_info
         )
 
         # Validate results
@@ -627,7 +739,7 @@ class Detect3DNode(LifecycleNode):
 
         # Compute width (x-axis) statistics from actual 3D points
         x_center, x_min, x_max = Detect3DNode._compute_width_bounds(
-            valid_coords, valid_depths, spatial_weights, depth_info
+            full_coords, full_depths, full_weights, depth_info
         )
 
         # Validate results
@@ -650,6 +762,177 @@ class Detect3DNode(LifecycleNode):
         msg.size.z = float(z_max - z_min)
 
         return msg
+
+    @staticmethod
+    def _erode_mask(mask: np.ndarray, erosion_ratio: float = 0.08) -> np.ndarray:
+        """
+        Erode a segmentation mask to suppress border pixels where depth bleeding
+        is typically strongest.
+
+        Args:
+            mask: Binary segmentation mask.
+            erosion_ratio: Fraction of the smallest mask axis used as erosion radius.
+
+        Returns:
+            Eroded mask, or the original mask when erosion would remove too much.
+        """
+        if mask is None or not isinstance(mask, np.ndarray) or mask.size == 0:
+            return mask
+
+        y_coords, x_coords = np.where(mask > 0)
+        if len(y_coords) == 0:
+            return mask
+
+        obj_h = int(y_coords.max() - y_coords.min())
+        obj_w = int(x_coords.max() - x_coords.min())
+        radius = max(2, int(min(obj_h, obj_w) * erosion_ratio))
+
+        if radius <= 0:
+            return mask
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+        )
+        eroded = cv2.erode(mask, kernel, iterations=1)
+
+        if np.count_nonzero(eroded) < 0.15 * np.count_nonzero(mask):
+            return mask
+
+        return eroded
+
+    @staticmethod
+    def _filter_foreground_depths(
+        depth_values: np.ndarray,
+        coords: np.ndarray,
+        spatial_weights: np.ndarray,
+        max_object_depth_extent: float = 0.30,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Keep only the depth cluster that is most likely to belong to the foreground.
+        """
+        if len(depth_values) < 4:
+            return depth_values, coords, spatial_weights
+
+        sorted_idx = np.argsort(depth_values)
+        sorted_d = depth_values[sorted_idx]
+        sorted_w = spatial_weights[sorted_idx]
+
+        cum_w = np.cumsum(sorted_w)
+        if cum_w[-1] <= 0:
+            return depth_values, coords, spatial_weights
+        cum_w /= cum_w[-1]
+
+        p5_idx = np.searchsorted(cum_w, 0.05)
+        z_front = sorted_d[min(max(p5_idx, 0), len(sorted_d) - 1)]
+        z_cutoff = z_front + max_object_depth_extent
+
+        keep_mask = depth_values <= z_cutoff
+        filtered_d = depth_values[keep_mask]
+        filtered_coords = coords[keep_mask]
+        filtered_w = spatial_weights[keep_mask]
+
+        min_keep = max(4, int(0.10 * len(depth_values)))
+        if len(filtered_d) < min_keep:
+            return depth_values, coords, spatial_weights
+
+        return filtered_d, filtered_coords, filtered_w
+
+    @staticmethod
+    def _detect_and_remove_background_mode(
+        depth_values: np.ndarray,
+        coords: np.ndarray,
+        spatial_weights: np.ndarray,
+        min_gap_meters: float = 0.08,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Detect a bimodal depth distribution and remove the farthest mode.
+        """
+        if len(depth_values) < 20:
+            return depth_values, coords, spatial_weights
+
+        depth_range = np.ptp(depth_values)
+        if not np.isfinite(depth_range) or depth_range < min_gap_meters:
+            return depth_values, coords, spatial_weights
+
+        n_bins = max(15, min(60, int(depth_range / 0.02)))
+        hist, edges = np.histogram(depth_values, bins=n_bins, weights=spatial_weights)
+
+        if len(hist) >= 5:
+            kernel = np.array([0.25, 0.5, 0.25])
+            hist_smooth = np.convolve(hist, kernel, mode="same")
+        else:
+            hist_smooth = hist.astype(float)
+
+        peaks = []
+        for i in range(1, len(hist_smooth) - 1):
+            if hist_smooth[i] > hist_smooth[i - 1] and hist_smooth[i] > hist_smooth[i + 1]:
+                center = (edges[i] + edges[i + 1]) / 2.0
+                peaks.append((center, hist_smooth[i]))
+
+        if len(peaks) < 2:
+            return depth_values, coords, spatial_weights
+
+        peaks.sort(key=lambda item: item[1], reverse=True)
+        primary_peak = peaks[0][0]
+        secondary_peak = peaks[1][0]
+
+        if abs(primary_peak - secondary_peak) < min_gap_meters:
+            return depth_values, coords, spatial_weights
+
+        foreground_peak = min(primary_peak, secondary_peak)
+        background_peak = max(primary_peak, secondary_peak)
+        gap = background_peak - foreground_peak
+        cutoff = foreground_peak + (0.60 * gap)
+
+        keep_mask = depth_values <= cutoff
+        filtered_d = depth_values[keep_mask]
+        filtered_coords = coords[keep_mask]
+        filtered_w = spatial_weights[keep_mask]
+
+        if len(filtered_d) < max(4, int(0.10 * len(depth_values))):
+            return depth_values, coords, spatial_weights
+
+        return filtered_d, filtered_coords, filtered_w
+
+    def _get_max_depth_extent(self, label: str) -> float:
+        """
+        Return the maximum expected depth extent for a class label.
+        """
+        if not label:
+            return self.depth_extent_limits["default"][1]
+
+        label_key = str(label).lower()
+        return self.depth_extent_limits.get(
+            label_key, self.depth_extent_limits["default"]
+        )[1]
+
+    @staticmethod
+    def _validate_bbox3d_extent(
+        z_center: float,
+        z_min: float,
+        z_max: float,
+        label: str,
+        depth_extent_limits: dict,
+    ) -> bool:
+        """
+        Validate whether the estimated 3D depth extent is physically plausible.
+        """
+        depth_extent = z_max - z_min
+        label_key = str(label).lower() if label else "default"
+        min_ext, max_ext = depth_extent_limits.get(
+            label_key, depth_extent_limits.get("default", (0.01, 0.60))
+        )
+
+        if not np.isfinite(depth_extent) or not np.isfinite(z_center):
+            return False
+
+        if depth_extent > max_ext:
+            return False
+
+        if depth_extent < min_ext:
+            return False
+
+        return True
 
     @staticmethod
     def _compute_spatial_weights(
